@@ -9,11 +9,13 @@ import (
 	"time"
 
 	"raptor-transit/internal/gtfs"
+	"raptor-transit/internal/timetable"
 )
 
 func main() {
 	in := flag.String("in", "data/google_transit.zip", "path to GTFS zip file")
-	out := flag.String("out", "data/gtfs.gob", "path to write the gob file")
+	out := flag.String("out", "data/gtfs.gob", "path to write the feed gob")
+	ttOut := flag.String("timetable", "data/timetable.gob", "path to write the compact timetable gob")
 	flag.Parse()
 
 	start := time.Now()
@@ -43,4 +45,19 @@ func main() {
 	fmt.Printf("  services:   %d\n", len(feed.Services))
 	fmt.Printf("wrote %s (%.1f MB) in %s total\n",
 		*out, float64(info.Size())/(1<<20), time.Since(start).Round(time.Millisecond))
+
+	ttStart := time.Now()
+	tt := timetable.Build(feed)
+	if err := tt.Save(*ttOut); err != nil {
+		fmt.Fprintf(os.Stderr, "ingest: %v\n", err)
+		os.Exit(1)
+	}
+	ttInfo, err := os.Stat(*ttOut)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ingest: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("built timetable: %d patterns from %d routes\n", len(tt.Patterns), len(tt.Routes))
+	fmt.Printf("wrote %s (%.1f MB) in %s\n",
+		*ttOut, float64(ttInfo.Size())/(1<<20), time.Since(ttStart).Round(time.Millisecond))
 }
