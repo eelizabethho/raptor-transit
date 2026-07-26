@@ -150,8 +150,17 @@ func (f *Feed) parseStopRow(r row) error {
 	if id == "" {
 		return fmt.Errorf("empty stop_id")
 	}
-	lat, _ := strconv.ParseFloat(r.get("stop_lat"), 64)
-	lon, _ := strconv.ParseFloat(r.get("stop_lon"), 64)
+	// A malformed coordinate must be an error, not a silent (0,0): Phase 2
+	// derives walking transfers from these coords, and a stop at (0,0)
+	// would quietly poison nearest-neighbor distances.
+	lat, err := strconv.ParseFloat(r.get("stop_lat"), 64)
+	if err != nil {
+		return fmt.Errorf("stop %s: bad stop_lat %q", id, r.get("stop_lat"))
+	}
+	lon, err := strconv.ParseFloat(r.get("stop_lon"), 64)
+	if err != nil {
+		return fmt.Errorf("stop %s: bad stop_lon %q", id, r.get("stop_lon"))
+	}
 	f.Stops[id] = Stop{ID: id, Name: r.get("stop_name"), Lat: lat, Lon: lon}
 	return nil
 }
@@ -196,6 +205,9 @@ func (f *Feed) parseStopTimeRow(r row) error {
 	seq, err := strconv.Atoi(r.get("stop_sequence"))
 	if err != nil {
 		return fmt.Errorf("stop_sequence: %w", err)
+	}
+	if r.get("stop_id") == "" {
+		return fmt.Errorf("trip %s seq %d: empty stop_id", tripID, seq)
 	}
 	f.StopTimesByTrip[tripID] = append(f.StopTimesByTrip[tripID], StopTime{
 		TripID:    tripID,
