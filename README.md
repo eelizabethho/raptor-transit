@@ -1,30 +1,131 @@
 # raptor-transit
 
-A Go implementation of the RAPTOR (Round-bAsed Public Transit Optimized Router)
-transit routing algorithm over King County Metro GTFS data. Phase 1 focuses on
-GTFS ingestion: downloading and parsing the feed into an internal format that
-the routing engine and HTTP API will build on. Standard library only — no
-third-party dependencies.
+A transit trip planner for Seattle, written from scratch in Go. Ask it "how do
+I get from the U District to downtown, leaving at 8:00 AM?" and it answers with
+real King County Metro itineraries — which route to board, where, and when you
+arrive:
 
-## Setup
-
-Go 1.23 is installed at `~/.local/go` on this machine. Add it to your PATH:
-
-```sh
-export PATH=$HOME/.local/go/bin:$PATH
+```
+$ ./bin/route -from 10911 -to 1120 -at 08:00:00 -date 20260805
+Option 1 — arrive 08:32:00, 0 transfer(s)
+  08:00:00  route 49     U District Station - Bay 3 -> Pine St & 4th Ave (arrive 08:32:00)
 ```
 
-## Build, test, run
+The routing engine implements **RAPTOR** (Round-bAsed Public Transit Optimized
+Router, [Delling, Pajor & Werneck 2015](https://www.microsoft.com/en-us/research/publication/round-based-public-transit-routing/)),
+the algorithm family used by real-world journey planners. Data comes from King
+County Metro's public [GTFS](https://gtfs.org/) feed (~6,400 stops, ~62,600
+trips, ~2.1M scheduled stop times).
 
-```sh
-make build   # compile everything into bin/
-make test    # run tests with the race detector
-make run     # start the HTTP server on :8080
-make lint    # run go vet
+## Tech stack
+
+- **Go 1.22+ standard library only.** Zero third-party dependencies — CSV
+  parsing via `encoding/csv`, persistence via `encoding/gob`, the zip feed via
+  `archive/zip`, HTTP via `net/http`, logging via `log/slog`. This is
+  deliberate: the project doubles as a Go learning exercise, so everything in
+  the repo is plain, readable stdlib Go.
+- **Data:** GTFS static feed from King County Metro (redistributed by Sound
+  Transit). Not committed to the repo; `make fetch` downloads it.
+- **Tooling:** Makefile, `go test -race`, `go vet`; multi-stage distroless
+  Dockerfile for the (stub) HTTP server.
+
+## How it works
+
+The pipeline has three stages — parse, preprocess, query:
+
+```
+GTFS zip ──> internal/gtfs ──> internal/timetable ──> internal/raptor ──> itineraries
+  (feed)      (parse CSV)      (compact structures)      (query engine)
+                                        +
+                              internal/transfers
+                              (walking links between
+                               nearby stops)
 ```
 
-Once running, check health with:
+### 1. Parse (`internal/gtfs`)
+
+Streams the GTFS CSV files out of the zip and into Go structs. Handles the
+messy realities of agency feeds: UTF-8 BOMs, CRLF line endings, optional
+columns (header-driven, not positional), and times past midnight — GTFS
+represents a 1:30 AM owl-service departure as `25:30:00` on the *previous*
+service day, so all times are stored as plain seconds-since-midnight ints that
+may exceed 86,400. Malformed rows (bad coordinates, empty IDs) fail loudly
+rather than parsing to silent zero values.
+
+### 2. Preprocess (`internal/timetable`, `internal/transfers`)
+
+RAPTOR's core invariant is that every trip of a "route" visits the same stops
+in the same order — but GTFS `route_id`s break that promise (a single KCM route
+number mixes express, short-turn, and branch variants). `internal/timetable`
+therefore regroups trips by their **exact ordered stop sequence**: on the
+current feed, 157 GTFS routes explode into 532 true stop patterns. Everything
+is flattened into dense int32 arrays (each stop time stored exactly once,
+~17 MB serialized vs ~130 MB for the raw parse) with byte-deterministic gob
+output.
+
+KCM publishes no `transfers.txt`, so `internal/transfers` synthesizes walking
+links: every pair of stops within 200 m (haversine) gets a footpath at 1.2 m/s
+walking speed. A lat/lon grid keeps generation near-linear instead of O(n²)
+over all ~6.4k stops; the grid's output is unit-tested to match a brute-force
+reference exactly. Current feed: 14,342 footpaths.
+
+### 3. Query (`internal/raptor`)
+
+Classic RAPTOR rounds: round *k* computes the earliest arrival at every stop
+using at most *k* buses. Each round scans only the patterns that serve stops
+improved in the previous round, then relaxes walking footpaths, with local and
+target pruning. Service calendars (`calendar.txt` + `calendar_dates.txt`
+exceptions) filter which trips run on the query date, and the engine also
+scans the *previous* service day so owl trips timetabled past 24:00:00 are
+catchable after midnight. The result is a Pareto set — for each number of
+transfers, the best achievable arrival — with full journey reconstruction via
+parent pointers.
+
+Measured on the full KCM feed (300 random queries): **p50 ≈ 14 ms, p95 ≈ 28 ms**
+per query; the query CLI peaks at ~55 MB RSS end-to-end.
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `cmd/ingest` | Parses the feed zip → `data/gtfs.gob` + `data/timetable.gob` |
+| `cmd/route` | Terminal trip-planning queries (see example above) |
+| `cmd/server` | HTTP server stub (`/healthz` only; API is a later phase) |
+| `internal/gtfs` | GTFS zip/CSV parser and raw feed model |
+| `internal/timetable` | Compact stop-pattern timetable the engine scans |
+| `internal/transfers` | Walking-footpath generation from stop coordinates |
+| `internal/raptor` | The RAPTOR query engine |
+| `internal/api`, `internal/calendar` | Empty stubs for later phases |
+| `testdata/ground_truth.json` | Known-good journeys used as an oracle for engine correctness |
+| `docs/FEED_NOTES.md` | Detailed analysis of the live KCM feed's quirks |
+| `docs/CONTEXT.md` | Project status, decisions, and next steps |
+
+## Getting started
+
+Requires Go 1.22+ on PATH. (On the original dev machine it's installed at
+`~/.local/go`: `export PATH=$HOME/.local/go/bin:$PATH`.)
 
 ```sh
-curl localhost:8080/healthz
+make fetch    # download the KCM GTFS feed (~17.5 MB) into data/
+make ingest   # parse it and write data/*.gob (~6 s)
+make build    # compile everything into bin/
+make test     # full test suite with the race detector (needs the feed for
+              # real-data tests; they skip gracefully without it)
+
+# Plan a trip: stop IDs are KCM stop numbers (the number on the bus stop sign)
+./bin/route -from 10911 -to 1120 -at 08:00:00 -date 20260805
 ```
+
+## Testing strategy
+
+- **Fixture tests** against a tiny hand-written GTFS feed
+  (`internal/gtfs/testdata/mini/`) with documented expected results —
+  including an overnight trip and a calendar-exception-only service.
+- **Real-feed tests** (skipped when `data/` is empty): parse the full feed,
+  assert pattern invariants over all 532 patterns, gob round-trip equality.
+- **Ground truth** (`testdata/ground_truth.json`): journeys with known correct
+  answers. Direct-trip cases were extracted from the raw schedule
+  independently of the parser; transfer cases are human-verified against
+  Google Maps/OneBusAway. The engine must match arrivals within tolerance.
+- **Property checks**: the footpath grid is asserted equal to an O(n²)
+  brute-force reference; builds are asserted byte-deterministic.
