@@ -1,0 +1,4 @@
+route_id,service_id,trip_id
+R1,WKDY,R1_T1
+R1,WKDY,R1_T2
+R2,SPECIAL,R2_OWL1

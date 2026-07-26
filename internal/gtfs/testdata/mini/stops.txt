@@ -1,0 +1,6 @@
+stop_id,stop_name,stop_lat,stop_lon
+S1,Pike St & 3rd Ave,47.609421,-122.337631
+S2,Westlake Station,47.611511,-122.337280
+S3,Capitol Hill Station,47.619850,-122.320328
+S4,University District Station,47.660160,-122.313480
+S5,Northgate Station,47.702920,-122.328480

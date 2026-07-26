@@ -1,0 +1,3 @@
+﻿route_id,route_short_name,route_long_name,route_type
+R1,10,Downtown - Capitol Hill - Northgate,3
+R2,84,Night Owl Downtown - University District,3
