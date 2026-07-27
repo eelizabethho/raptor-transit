@@ -36,6 +36,10 @@ func TestQueryLatencyP95(t *testing.T) {
 	p99 := durs[runs*99/100]
 	max := durs[runs-1]
 	t.Logf("query latency over %d random queries: p50=%s p95=%s p99=%s max=%s", runs, p50, p95, p99, max)
+	if raceEnabled {
+		t.Log("race detector enabled: skipping p95 assertion (instrumentation is ~10x slower)")
+		return
+	}
 	if p95 > 200*time.Millisecond {
 		t.Errorf("p95 = %s, want < 200ms", p95)
 	}
