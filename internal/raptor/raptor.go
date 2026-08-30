@@ -12,8 +12,8 @@ package raptor
 import (
 	"fmt"
 	"math"
-	"time"
 
+	"raptor-transit/internal/calendar"
 	"raptor-transit/internal/timetable"
 	"raptor-transit/internal/transfers"
 )
@@ -87,7 +87,7 @@ func (e *Engine) Query(sourceID, targetID string, depTime int32, date string) ([
 	if !ok {
 		return nil, fmt.Errorf("unknown target stop %q", targetID)
 	}
-	day, err := time.Parse("20060102", date)
+	day, err := calendar.ParseDate(date)
 	if err != nil {
 		return nil, fmt.Errorf("bad date %q (want YYYYMMDD): %w", date, err)
 	}
@@ -96,8 +96,8 @@ func (e *Engine) Query(sourceID, targetID string, depTime int32, date string) ([
 	// service ran YESTERDAY and the relevant times exceed 86400: GTFS
 	// timetables overnight trips on the day they started, so yesterday's
 	// 25:30:00 departure is 01:30:00 on today's clock.
-	activeToday := e.activeServices(day)
-	activeYesterday := e.activeServices(day.AddDate(0, 0, -1))
+	activeToday := calendar.ActiveServices(e.tt.Services, day)
+	activeYesterday := calendar.ActiveServices(e.tt.Services, day.AddDate(0, 0, -1))
 
 	nStops := len(e.tt.StopIDs)
 	// tauPrev: labels of the previous round (boarding reads these — the
@@ -124,7 +124,7 @@ func (e *Engine) Query(sourceID, targetID string, depTime int32, date string) ([
 		if arr < tauBest[fp.To] {
 			tauPrev[fp.To], tau[fp.To], tauBest[fp.To] = arr, arr, arr
 			parents[0][fp.To] = parent{
-				leg: Leg{Trip: -1, FromStop: source, ToStop: fp.To, Departure: depTime, Arrival: arr},
+				leg:       Leg{Trip: -1, FromStop: source, ToStop: fp.To, Departure: depTime, Arrival: arr},
 				prevRound: 0, set: true,
 			}
 			marked[fp.To] = true
@@ -150,8 +150,8 @@ func (e *Engine) Query(sourceID, targetID string, depTime int32, date string) ([
 
 		for pi, startPos := range queue {
 			p := &e.tt.Patterns[pi]
-			trip := -1     // index into p.Trips of the trip we're riding
-			var offset int32   // 0 = today's trip, -86400 = yesterday's overnight
+			trip := -1       // index into p.Trips of the trip we're riding
+			var offset int32 // 0 = today's trip, -86400 = yesterday's overnight
 			var boardPos int
 			var boardDep int32
 
@@ -281,19 +281,6 @@ func (e *Engine) reconstruct(parents [][]parent, source, target int32, k int, de
 		j.Departure = legs[0].Departure
 	}
 	return j, nil
-}
-
-// activeServices returns the service_ids running on the given day.
-func (e *Engine) activeServices(day time.Time) map[string]bool {
-	date := day.Format("20060102")
-	wd := day.Weekday()
-	active := make(map[string]bool)
-	for _, svc := range e.tt.Services {
-		if svc.ActiveOn(date, wd) {
-			active[svc.ID] = true
-		}
-	}
-	return active
 }
 
 // earliestTrip finds the earliest catchable trip of pattern p at stop
