@@ -27,7 +27,7 @@ trips, ~2.1M scheduled stop times).
 - **Data:** GTFS static feed from King County Metro (redistributed by Sound
   Transit). Not committed to the repo; `make fetch` downloads it.
 - **Tooling:** Makefile, `go test -race`, `go vet`; multi-stage distroless
-  Dockerfile for the (stub) HTTP server.
+  Dockerfile for the HTTP server.
 
 ## How it works
 
@@ -84,18 +84,69 @@ parent pointers.
 Measured on the full KCM feed (300 random queries): **p50 ≈ 14 ms, p95 ≈ 28 ms**
 per query; the query CLI peaks at ~55 MB RSS end-to-end.
 
+### 4. Serve (`internal/api`, `internal/stopsearch`, `cmd/server`)
+
+`cmd/server` loads the timetable and generates footpaths once at startup —
+the load and grid build together take far longer than the ~14 ms query, so
+doing them per request would dominate the response. `raptor.Engine` allocates
+its own working state per call and shares nothing mutable, so one instance
+serves every request without locking.
+
+Riders know "Westlake Station", not stop 1120, so `internal/stopsearch`
+matches over a normalized name form (lowercased, punctuation dropped,
+whitespace collapsed) and ranks exact > prefix > substring. Both the API and
+the CLI accept a stop name or a stop_id in either position. An ambiguous name
+is reported with its candidates rather than resolved by guessing — quietly
+planning from the wrong "Station" is worse than an error.
+
+```
+$ curl -s 'localhost:8080/route?from=U+District+Station&to=Westlake&at=08:00:00&date=20260901'
+{
+  "origin":      {"id": "10911", "name": "U District Station - Bay 3"},
+  "destination": {"id": "1120",  "name": "Pine St & 4th Ave"},
+  "date": "20260901", "depart_after": "08:00:00",
+  "journeys": [{
+    "departure": "08:00:00", "arrival": "08:32:00",
+    "duration_seconds": 1920, "transfers": 0,
+    "legs": [{"mode": "transit", "route": "49", "trip_id": "...",
+              "from": {...}, "to": {...},
+              "departure": "08:00:00", "arrival": "08:32:00"}]
+  }]
+}
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /route?from=&to=&at=&date=` | Journeys. `from`/`to` take a stop_id or a name; `at` is `HH:MM:SS`, `date` is `YYYYMMDD`. |
+| `GET /stops?q=&limit=` | Stop-name search, for autocomplete. |
+| `GET /healthz` | Liveness. Only 200 once the timetable is loaded. |
+
+Status codes carry a deliberate distinction: **400** for malformed or missing
+parameters and ambiguous stop names, **404** for a stop that matches nothing,
+and **200 with `"journeys": []`** when the query is well formed but nothing is
+reachable. "No bus goes there" is an answer, not an error. When the empty
+result is caused by a date outside the feed's service window — easy to hit,
+since the current feed ends 2027-03-26 — the response says so in `notes`.
+
+Wire times are `HH:MM:SS` strings that keep hours past 24 intact
+(`"25:30:00"` with `"next_day": true`) rather than wrapping to `01:30:00` and
+appearing to arrive before departure. Raw seconds are included alongside for
+clients doing arithmetic.
+
 ## Repository layout
 
 | Path | What it is |
 |---|---|
 | `cmd/ingest` | Parses the feed zip → `data/gtfs.gob` + `data/timetable.gob` |
 | `cmd/route` | Terminal trip-planning queries (see example above) |
-| `cmd/server` | HTTP server stub (`/healthz` only; API is a later phase) |
+| `cmd/server` | HTTP API server (`/route`, `/stops`, `/healthz`) |
 | `internal/gtfs` | GTFS zip/CSV parser and raw feed model |
 | `internal/timetable` | Compact stop-pattern timetable the engine scans |
 | `internal/transfers` | Walking-footpath generation from stop coordinates |
 | `internal/raptor` | The RAPTOR query engine |
-| `internal/api`, `internal/calendar` | Empty stubs for later phases |
+| `internal/api` | HTTP handlers and the JSON wire format |
+| `internal/calendar` | Which GTFS services run on a given date |
+| `internal/stopsearch` | Stop-name lookup ("Westlake Station" -> stop index) |
 | `testdata/ground_truth.json` | Known-good journeys used as an oracle for engine correctness |
 | `docs/FEED_NOTES.md` | Detailed analysis of the live KCM feed's quirks |
 | `docs/CONTEXT.md` | Project status, decisions, and next steps |
@@ -112,8 +163,15 @@ make build    # compile everything into bin/
 make test     # full test suite with the race detector (needs the feed for
               # real-data tests; they skip gracefully without it)
 
-# Plan a trip: stop IDs are KCM stop numbers (the number on the bus stop sign)
+# Plan a trip from the terminal. -from/-to take a stop name or a stop_id
+# (KCM stop numbers are the ones printed on the bus stop sign).
 ./bin/route -from 10911 -to 1120 -at 08:00:00 -date 20260805
+./bin/route -from "U District Station" -to Westlake -at 08:00:00 -date 20260805
+
+# Or serve the same thing over HTTP.
+./bin/server                       # listens on :8080
+curl -s 'localhost:8080/stops?q=Westlake'
+curl -s 'localhost:8080/route?from=10911&to=1120&at=08:00:00&date=20260805'
 ```
 
 ## Testing strategy
@@ -129,3 +187,8 @@ make test     # full test suite with the race detector (needs the feed for
   Google Maps/OneBusAway. The engine must match arrivals within tolerance.
 - **Property checks**: the footpath grid is asserted equal to an O(n²)
   brute-force reference; builds are asserted byte-deterministic.
+- **API tests** drive the real mux through `httptest` against the fixture
+  feed — status-code semantics, the overnight-clock encoding, and
+  `journeys: []` rather than `null`. A concurrency test fires 40 simultaneous
+  requests at the shared engine, which is the assertion that lock-free
+  sharing is actually safe under `-race`.
