@@ -10,6 +10,7 @@ import (
 
 	"raptor-transit/internal/gtfs"
 	"raptor-transit/internal/raptor"
+	"raptor-transit/internal/realtime"
 	"raptor-transit/internal/timetable"
 )
 
@@ -320,5 +321,102 @@ func TestQueryIsRepeatable(t *testing.T) {
 		if got := get(t, s, target, nil).Body.String(); got != first {
 			t.Fatalf("run %d differs:\n %s\n %s", i, first, got)
 		}
+	}
+}
+
+// fixedDelays is a raptor.Delays that reports the same lateness for every
+// stop event, which is enough to prove the overlay reaches the engine and
+// moves the answer.
+type fixedDelays int32
+
+func (d fixedDelays) Delay(trip, stop int32) int32 { return int32(d) }
+
+// Without ?realtime=true the overlay must not be consulted, even when one
+// is installed: a stale or wrong feed should never silently alter the
+// scheduled answer a client asked for.
+func TestRealtimeIsOptIn(t *testing.T) {
+	s := testServer(t)
+	s.SetDelays(func() raptor.Delays { return fixedDelays(600) })
+
+	var sched RouteResponse
+	get(t, s, "/route?from=S1&to=S5&at=07:00:00&date="+weekday, &sched)
+	if len(sched.Journeys) == 0 {
+		t.Fatal("no scheduled journey")
+	}
+	if sched.Journeys[0].Arrival != "08:26:00" {
+		t.Errorf("scheduled arrival = %q, want 08:26:00", sched.Journeys[0].Arrival)
+	}
+	if sched.Realtime {
+		t.Error("realtime = true on a request that did not ask for it")
+	}
+}
+
+func TestRealtimeShiftsArrival(t *testing.T) {
+	s := testServer(t)
+	s.SetDelays(func() raptor.Delays { return fixedDelays(600) })
+
+	var rt RouteResponse
+	get(t, s, "/route?from=S1&to=S5&at=07:00:00&date="+weekday+"&realtime=true", &rt)
+	if len(rt.Journeys) == 0 {
+		t.Fatal("no realtime journey")
+	}
+	if !rt.Realtime {
+		t.Error("realtime = false though an overlay was applied")
+	}
+	// Scheduled arrival 08:26:00 plus a uniform 10 minutes.
+	if got := rt.Journeys[0].Arrival; got != "08:36:00" {
+		t.Errorf("realtime arrival = %q, want 08:36:00", got)
+	}
+}
+
+// Asking for realtime on a server with no feed must still answer, using
+// scheduled times, and say so rather than failing or quietly pretending
+// the times are live.
+func TestRealtimeUnavailableFallsBackToSchedule(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*Server)
+	}{
+		{"not configured", func(*Server) {}},
+		{"configured but no feed yet", func(s *Server) {
+			s.SetDelays(func() raptor.Delays { return nil })
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServer(t)
+			tc.setup(s)
+			var resp RouteResponse
+			rec := get(t, s, "/route?from=S1&to=S5&at=07:00:00&date="+weekday+"&realtime=true", &resp)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if resp.Realtime {
+				t.Error("realtime = true with no overlay applied")
+			}
+			if resp.Journeys[0].Arrival != "08:26:00" {
+				t.Errorf("arrival = %q, want the scheduled 08:26:00", resp.Journeys[0].Arrival)
+			}
+			if len(resp.Notes) == 0 {
+				t.Error("no note explaining why realtime was not applied")
+			}
+		})
+	}
+}
+
+// A typed-nil overlay must behave like no overlay. This is the classic Go
+// trap: a nil *Overlay in a non-nil interface is != nil, so the engine
+// would call through it.
+func TestRealtimeTypedNilOverlayIsSafe(t *testing.T) {
+	s := testServer(t)
+	var typedNil *realtime.Overlay
+	s.SetDelays(func() raptor.Delays { return typedNil })
+
+	var resp RouteResponse
+	rec := get(t, s, "/route?from=S1&to=S5&at=07:00:00&date="+weekday+"&realtime=true", &resp)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if len(resp.Journeys) == 0 || resp.Journeys[0].Arrival != "08:26:00" {
+		t.Errorf("typed-nil overlay changed the scheduled answer: %+v", resp.Journeys)
 	}
 }

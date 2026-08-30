@@ -31,12 +31,23 @@ type Server struct {
 	tt     *timetable.Timetable
 	engine *raptor.Engine
 	stops  *stopsearch.Index
+
+	// delays, when set, supplies a live overlay for ?realtime=true. It is
+	// a function rather than a stored snapshot because the snapshot is
+	// replaced by the poller on every refresh: the handler must read the
+	// current one per request, not capture one at startup.
+	delays func() raptor.Delays
 }
 
 // NewServer builds a Server over an already-loaded timetable and engine.
 func NewServer(tt *timetable.Timetable, engine *raptor.Engine) *Server {
 	return &Server{tt: tt, engine: engine, stops: stopsearch.New(tt)}
 }
+
+// SetDelays installs a source of live delays, enabling ?realtime=true. The
+// function is called once per realtime request and may return nil when no
+// feed has been fetched yet. Call before serving; it is not synchronized.
+func (s *Server) SetDelays(f func() raptor.Delays) { s.delays = f }
 
 // Routes returns a mux with the API endpoints mounted. The caller adds
 // operational endpoints (health, metrics) so this package stays about the
@@ -112,7 +123,27 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	journeys, err := s.engine.Query(fromID, toID, int32(dep), date)
+	// ?realtime=true opts into the live delay overlay. It is deliberately
+	// outside the required-parameter loop above: absent means schedule.
+	var (
+		delays raptor.Delays
+		rtNote string
+		wantRT = q.Get("realtime") == "true"
+	)
+	if wantRT {
+		switch {
+		case s.delays == nil:
+			rtNote = "realtime was requested but this server has no realtime feed configured; times are scheduled"
+		default:
+			if d := s.delays(); d != nil {
+				delays = d
+			} else {
+				rtNote = "realtime was requested but no feed has been fetched yet; times are scheduled"
+			}
+		}
+	}
+
+	journeys, err := s.engine.QueryWith(fromID, toID, int32(dep), date, delays)
 	if err != nil {
 		// Stops and date are already validated above, so anything left is
 		// a genuine server-side failure rather than bad input.
@@ -142,6 +173,10 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		resp.Notes = append(resp.Notes,
 			"no service runs on "+date+"; the loaded feed does not cover that date")
 	}
+	if rtNote != "" {
+		resp.Notes = append(resp.Notes, rtNote)
+	}
+	resp.Realtime = wantRT && delays != nil
 
 	writeJSON(w, http.StatusOK, resp)
 }

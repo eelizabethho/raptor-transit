@@ -23,6 +23,7 @@ import (
 
 	"raptor-transit/internal/api"
 	"raptor-transit/internal/raptor"
+	"raptor-transit/internal/realtime"
 	"raptor-transit/internal/timetable"
 	"raptor-transit/internal/transfers"
 )
@@ -37,6 +38,8 @@ const (
 func main() {
 	ttPath := flag.String("timetable", "data/timetable.gob", "path to timetable gob (from cmd/ingest)")
 	addr := flag.String("addr", ":8080", "listen address")
+	rtURL := flag.String("realtime", "", "GTFS-Realtime TripUpdates URL; empty disables ?realtime=true (KCM: "+realtime.KCMTripUpdatesURL+")")
+	rtEvery := flag.Duration("realtime-interval", 30*time.Second, "how often to refetch the realtime feed")
 	flag.Parse()
 
 	// slog is Go's standard structured logger. The JSON handler writes one
@@ -66,7 +69,33 @@ func main() {
 		"took", time.Since(start).String(),
 	)
 
-	mux := api.NewServer(tt, engine).Routes()
+	apiSrv := api.NewServer(tt, engine)
+
+	// Realtime is opt-in. The poller owns the current snapshot and swaps
+	// it atomically; the handler reads whatever is current per request,
+	// so a refresh never disturbs an in-flight query.
+	rootCtx, stopPolling := context.WithCancel(context.Background())
+	defer stopPolling()
+	if *rtURL != "" {
+		poller := realtime.NewPoller(*rtURL, *rtEvery, nil)
+		// One synchronous fetch so the first request isn't schedule-only,
+		// but a failure here is not fatal: scheduled routing still works.
+		if err := poller.Refresh(rootCtx); err != nil {
+			slog.Warn("initial realtime fetch failed; serving scheduled times until it recovers",
+				"url", *rtURL, "error", err)
+		}
+		go poller.Run(rootCtx)
+		apiSrv.SetDelays(func() raptor.Delays {
+			snap := poller.Current()
+			if snap == nil {
+				return nil
+			}
+			return realtime.NewOverlay(tt, snap)
+		})
+		slog.Info("realtime enabled", "url", *rtURL, "interval", rtEvery.String())
+	}
+
+	mux := apiSrv.Routes()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 
 	server := &http.Server{

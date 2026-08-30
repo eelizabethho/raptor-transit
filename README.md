@@ -19,13 +19,17 @@ trips, ~2.1M scheduled stop times).
 
 ## Tech stack
 
-- **Go 1.22+ standard library only.** Zero third-party dependencies — CSV
-  parsing via `encoding/csv`, persistence via `encoding/gob`, the zip feed via
-  `archive/zip`, HTTP via `net/http`, logging via `log/slog`. This is
-  deliberate: the project doubles as a Go learning exercise, so everything in
-  the repo is plain, readable stdlib Go.
+- **Go 1.23+, effectively stdlib only.** CSV parsing via `encoding/csv`,
+  persistence via `encoding/gob`, the zip feed via `archive/zip`, HTTP via
+  `net/http`, logging via `log/slog`. This is deliberate: the project doubles
+  as a Go learning exercise, so everything in the repo is plain, readable
+  stdlib Go. The one exception is `internal/realtime`, which needs
+  `google.golang.org/protobuf` and the GTFS-Realtime bindings because
+  GTFS-RT is protobuf and there is no stdlib path to decoding it. The
+  dependency is confined to that package.
 - **Data:** GTFS static feed from King County Metro (redistributed by Sound
-  Transit). Not committed to the repo; `make fetch` downloads it.
+  Transit). Not committed to the repo; `make fetch` downloads it. Live delays
+  come from KCM's GTFS-Realtime TripUpdates feed, polled at runtime.
 - **Tooling:** Makefile, `go test -race`, `go vet`; multi-stage distroless
   Dockerfile for the HTTP server.
 
@@ -117,7 +121,7 @@ $ curl -s 'localhost:8080/route?from=U+District+Station&to=Westlake&at=08:00:00&
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /route?from=&to=&at=&date=` | Journeys. `from`/`to` take a stop_id or a name; `at` is `HH:MM:SS`, `date` is `YYYYMMDD`. |
+| `GET /route?from=&to=&at=&date=` | Journeys. `from`/`to` take a stop_id or a name; `at` is `HH:MM:SS`, `date` is `YYYYMMDD`. Add `&realtime=true` for live delays. |
 | `GET /stops?q=&limit=` | Stop-name search, for autocomplete. |
 | `GET /healthz` | Liveness. Only 200 once the timetable is loaded. |
 
@@ -127,6 +131,26 @@ and **200 with `"journeys": []`** when the query is well formed but nothing is
 reachable. "No bus goes there" is an answer, not an error. When the empty
 result is caused by a date outside the feed's service window — easy to hit,
 since the current feed ends 2027-03-26 — the response says so in `notes`.
+
+### Realtime
+
+`cmd/server -realtime https://s3.amazonaws.com/kcm-alerts-realtime-prod/tripupdates.pb`
+enables `?realtime=true`. A background poller refetches on an interval
+(`-realtime-interval`, default 30s), parses the feed into an immutable
+snapshot, and publishes it through an atomic pointer; each request reads
+whichever snapshot is current, so a refresh never disturbs an in-flight query.
+
+Delays are applied as a **per-query overlay**, never merged into the
+timetable — the timetable is shared unsynchronised by every request precisely
+because it is read-only, and `?realtime=true` has to be a per-request choice
+rather than global state.
+
+Realtime degrades to the schedule rather than failing: without the flag, before
+the first successful fetch, or after a fetch error, the response carries
+scheduled times, `"realtime": false`, and a note saying why. A stop the feed
+says nothing about is treated as on-schedule — absence of an update is not a
+guarantee of punctuality. Delays outside [-10 min, +3 h] are discarded as
+data faults; a single live poll typically contains a few dozen.
 
 Wire times are `HH:MM:SS` strings that keep hours past 24 intact
 (`"25:30:00"` with `"next_day": true`) rather than wrapping to `01:30:00` and
@@ -143,6 +167,7 @@ clients doing arithmetic.
 | `internal/gtfs` | GTFS zip/CSV parser and raw feed model |
 | `internal/timetable` | Compact stop-pattern timetable the engine scans |
 | `internal/transfers` | Walking-footpath generation from stop coordinates |
+| `internal/realtime` | GTFS-Realtime polling, delay snapshots, engine overlay |
 | `internal/raptor` | The RAPTOR query engine |
 | `internal/api` | HTTP handlers and the JSON wire format |
 | `internal/calendar` | Which GTFS services run on a given date |

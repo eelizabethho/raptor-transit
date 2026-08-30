@@ -73,12 +73,61 @@ type parent struct {
 	set       bool
 }
 
+// Delays supplies live schedule deviation, in seconds, for a scheduled
+// stop event (positive = late). It is indexed by timetable indices: trip
+// is a tripIdx (as stored in Pattern.Trips), stop is a stopIdx (as stored
+// in Pattern.Stops).
+//
+// An implementation must be immutable and safe for concurrent reads for
+// the whole life of a query, and its Delay must be nil-receiver-safe so a
+// typed-nil overlay behaves like no overlay at all.
+//
+// The engine never learns where delays come from; internal/realtime
+// adapts a GTFS-Realtime feed to this interface. Keeping it an interface
+// declared here means package raptor imports nothing new.
+type Delays interface {
+	Delay(trip, stop int32) int32
+}
+
+// arrivalAt and departureAt are the only places a stop time is read. Every
+// scan site goes through them so a delay can never be applied to one side
+// of a comparison and not the other.
+//
+// The delay is applied in the trip's own clock frame, before any
+// yesterday/-86400 shift, so overnight handling stays correct.
+func arrivalAt(p *timetable.Pattern, d Delays, trip, pos int) int32 {
+	v := p.Arrival(trip, pos)
+	if d != nil {
+		v += d.Delay(p.Trips[trip], p.Stops[pos])
+	}
+	return v
+}
+
+func departureAt(p *timetable.Pattern, d Delays, trip, pos int) int32 {
+	v := p.Departure(trip, pos)
+	if d != nil {
+		v += d.Delay(p.Trips[trip], p.Stops[pos])
+	}
+	return v
+}
+
 // Query computes Pareto-optimal journeys (arrival time vs transfers) from
 // source to target departing at or after depTime (seconds since midnight,
 // 0..86399) on the given service date (YYYYMMDD). Journeys are returned
 // in increasing-transfer order, each with a strictly earlier arrival than
 // the previous; empty slice if nothing is reachable within MaxRounds.
 func (e *Engine) Query(sourceID, targetID string, depTime int32, date string) ([]Journey, error) {
+	return e.QueryWith(sourceID, targetID, depTime, date, nil)
+}
+
+// QueryWith is Query with an optional live-delay overlay. A nil delays
+// argument is schedule-only and identical to Query.
+//
+// The overlay is a per-query argument rather than engine state precisely
+// because Engine is a process-wide singleton shared by every concurrent
+// request: storing a mutable overlay on it would race in-flight queries
+// and make ?realtime=true a global rather than a per-request choice.
+func (e *Engine) QueryWith(sourceID, targetID string, depTime int32, date string, delays Delays) ([]Journey, error) {
 	source, ok := e.tt.StopIdx(sourceID)
 	if !ok {
 		return nil, fmt.Errorf("unknown source stop %q", sourceID)
@@ -162,7 +211,7 @@ func (e *Engine) Query(sourceID, targetID string, depTime int32, date string) ([
 				// arrivals at or past the best target arrival can't
 				// contribute to the Pareto set.
 				if trip >= 0 {
-					if arr := p.Arrival(trip, pos) + offset; arr < tauBest[stop] && arr < bestTargetArrival {
+					if arr := arrivalAt(p, delays, trip, pos) + offset; arr < tauBest[stop] && arr < bestTargetArrival {
 						tau[stop] = arr
 						tauBest[stop] = arr
 						parents[k][stop] = parent{
@@ -187,8 +236,8 @@ func (e *Engine) Query(sourceID, targetID string, depTime int32, date string) ([
 				// Board (or upgrade to) the earliest catchable trip using
 				// the previous round's label at this stop.
 				if ready := tauPrev[stop]; ready != infinity {
-					if t, off, dep := e.earliestTrip(p, pos, ready, activeToday, activeYesterday); t >= 0 {
-						if trip < 0 || dep < p.Departure(trip, pos)+offset {
+					if t, off, dep := e.earliestTrip(p, pos, ready, activeToday, activeYesterday, delays); t >= 0 {
+						if trip < 0 || dep < departureAt(p, delays, trip, pos)+offset {
 							trip, offset, boardPos, boardDep = t, off, pos, dep
 						}
 					}
@@ -294,10 +343,15 @@ func (e *Engine) reconstruct(parents [][]parent, source, target int32, k int, de
 // so a full scan comparing both interpretations keeps this simple and
 // correct. Patterns have few trips (tens to low hundreds), so the linear
 // scan is cheap; binary search is a later optimization if profiles say so.
-func (e *Engine) earliestTrip(p *timetable.Pattern, pos int, ready int32, today, yesterday map[string]bool) (int, int32, int32) {
+//
+// Realtime depends on that: delays can reorder trips relative to the
+// scheduled sort in p.Trips, so a linear minimum stays correct where a
+// binary search over the scheduled order would not. Do not "optimize"
+// this to a binary search without first making the overlay order-preserving.
+func (e *Engine) earliestTrip(p *timetable.Pattern, pos int, ready int32, today, yesterday map[string]bool, delays Delays) (int, int32, int32) {
 	best, bestOff, bestDep := -1, int32(0), infinity
 	for t := 0; t < p.NumTrips(); t++ {
-		dep := p.Departure(t, pos)
+		dep := departureAt(p, delays, t, pos)
 		if dep >= ready && dep < bestDep && today[p.ServiceIDs[t]] {
 			best, bestOff, bestDep = t, 0, dep
 		}

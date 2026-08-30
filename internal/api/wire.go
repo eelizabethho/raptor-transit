@@ -79,6 +79,10 @@ type RouteResponse struct {
 	Destination StopRef `json:"destination"`
 	Date        string  `json:"date"`
 	DepartAfter string  `json:"depart_after"`
+	// Realtime reports whether a live delay overlay was actually applied.
+	// A client that asked for realtime and got false should treat the
+	// times as scheduled; the reason is in Notes.
+	Realtime bool `json:"realtime"`
 	// Journeys is never null — an unreachable query returns [] with 200.
 	Journeys []Journey `json:"journeys"`
 	// Notes carries non-fatal context, e.g. that the requested date falls

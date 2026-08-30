@@ -4,7 +4,7 @@ Status, decisions, and next steps for raptor-transit. Update this doc at the
 end of each phase so anyone (or any AI assistant) picking up the project can
 get current without spelunking through git history.
 
-_Last updated: 2026-08-30 (end of Phase 3)._
+_Last updated: 2026-08-30 (Phase 3 complete; Phase 4 realtime overlay landed)._
 
 ## Where the project stands
 
@@ -14,7 +14,7 @@ _Last updated: 2026-08-30 (end of Phase 3)._
 | 2 | Compact timetable, walking transfers, RAPTOR engine, `cmd/route` CLI, validation harness | **Done** |
 | 3 | HTTP API (`internal/api`, `cmd/server`), stop-name search, `internal/calendar` | **Done** |
 | 3.5 | Verify the 14 remaining ground-truth cases | Not started — **do before Phase 4** |
-| 4 | GTFS-Realtime ingestion (`internal/realtime`) | Not started |
+| 4 | GTFS-Realtime ingestion (`internal/realtime`), `?realtime=true` | **Done** (in-process poller; deployment is Phase 5) |
 | 5 | GCP pipeline: RT polling, Pub/Sub, BigQuery delay history | Not started |
 | 6 | PyTorch reliability model, journey reranking | Not started (needs months of Phase 5 data) |
 | 7 | Calendar-aware "when should I leave" (arrive-by queries) | Not started |
@@ -28,6 +28,10 @@ Verified numbers as of Phase 2 (full KCM feed, SPR26 service):
 - Ground truth: 6/6 verified cases pass; **14 of 20 cases still unverified**
   (all the transfer cases — see TODO 1)
 - API: `/route`, `/stops`, `/healthz`; startup loads timetable + footpaths once
+- Realtime (live KCM TripUpdates, 2026-08-30 sample): 844 trips / 26,033
+  stop-time updates / 25,736 arrival delays per poll; 12 canceled trips;
+  64 updates rejected as implausible. Delay distribution p50 0 s, p90 267 s,
+  p99 814 s; 8.7% more than 5 minutes late.
 
 ## Key design decisions (and why)
 
@@ -61,7 +65,33 @@ Verified numbers as of Phase 2 (full KCM feed, SPR26 service):
 8. **Ambiguous stop names are never resolved by guessing.** Several KCM stops
    share a name; silently planning from the wrong one is worse than an error.
    Both API and CLI list the candidates and ask.
-9. **Ground truth is sacred.** Expected journey results come from the raw feed
+9. **Realtime is an overlay, never a mutation.** `timetable.Timetable` is
+   shared unsynchronised by every concurrent request precisely because it
+   is read-only after load. Live delays are parsed into an immutable
+   `realtime.Snapshot`, published through an `atomic.Pointer`, and passed
+   *per query* as a `raptor.Delays` argument (`Engine.QueryWith`). Delays
+   are therefore a per-request choice, not engine state — which is what
+   makes `?realtime=true` possible without a second engine or a lock on
+   the hot path.
+10. **The stdlib-only rule ends at Phase 4, as predicted.** GTFS-Realtime
+   is protobuf and there is no stdlib path to decoding it, so
+   `internal/realtime` depends on `google.golang.org/protobuf` and
+   `github.com/MobilityData/gtfs-realtime-bindings`. These are the only
+   third-party dependencies in the project; everything else is still
+   stdlib, and the dependency is confined to that one package.
+11. **Live feeds carry garbage, so delays are bounded.** A single real poll
+   contained a stop reporting 2,489 seconds *early* and 64 out-of-band
+   values overall. `realtime` drops anything outside
+   [-600 s, +10800 s] rather than saturating it: a nonsense value must not
+   become a merely implausible one. An unknown stop event means "no
+   information" and is treated as on-schedule, never as a guarantee.
+12. **The overlay joins on (trip_id, stop_id), not stop_sequence.** The
+   timetable keeps only each stop's ordered position in its pattern, and
+   GTFS does not require sequences to be 1-based or contiguous, so `pos+1`
+   is not a safe join key. The cost is loop routes, where one delay covers
+   both visits to a repeated stop; `Stats.DuplicateStops` counts those so
+   the limitation is measurable rather than silent.
+13. **Ground truth is sacred.** Expected journey results come from the raw feed
    (awk, independent of our parser) or from humans checking Google Maps /
    OneBusAway. Never let the code under test generate its own expectations.
 
@@ -89,14 +119,20 @@ this is the short form.
    **before** Phase 4: realtime and (later) ML reranking both change which
    transfers the engine picks, and without the oracle you won't be able to
    tell a regression from a pre-existing bug.
-2. **Phase 4 — GTFS-Realtime**: poll KCM's TripUpdates feed, apply delays as
-   a swappable overlay over the immutable timetable (never mutate it — that's
-   what makes the engine shareable), expose `?realtime=true`. Note this is
-   where the stdlib-only rule dies: GTFS-RT is protobuf and there is no
-   stdlib path. Record that decision here when it happens.
+2. **Phase 4 — GTFS-Realtime**: done. `internal/realtime` polls KCM's
+   TripUpdates feed and `?realtime=true` applies it. `cmd/server -realtime
+   <url>` enables it; without the flag the endpoint answers from the
+   schedule and says so in `notes`. Still open: realtime is only exercised
+   against the live feed by `TestLiveFeed` (which skips without egress) and
+   has never been run against the *full static* feed, because a join
+   between live trip_ids and the real timetable needs `make fetch`.
 3. **Phase 5 — GCP**: Cloud Run poller -> Pub/Sub -> BigQuery delay history.
-   Mostly about *starting the clock*, since Phase 6 needs months of data.
-   Also automate feed refresh: the current feed window ends 2027-03-26.
+   Mostly about *starting the clock*, since Phase 6 needs months of data —
+   this is the long pole of the whole project and should be deployed before
+   any further feature work. `realtime.Poller` is already the shape the
+   Cloud Run job needs; what is missing is the sink (write each poll's
+   stop-time updates to BigQuery) and the deployment. Also automate feed
+   refresh: the current feed window ends 2027-03-26.
 4. **Phase 6 — PyTorch**: on-time probability model, served out-of-process
    and called from Go, reranking the RAPTOR Pareto set. Keep a per-(route,
    hour) historical-median baseline in the repo and report honestly if the
@@ -121,6 +157,13 @@ this is the short form.
 - The API tests build their timetable from `internal/gtfs/testdata/mini.zip`,
   so they need no feed and run in milliseconds. Real-feed API testing is
   still manual: `make ingest && go run ./cmd/server`, then curl.
+- `docs/GROUND_TRUTH_WORKSHEET.md` is the fill-in sheet for TODO 1, with a
+  Google Maps and OneBusAway link per case. It must be filled in by a human;
+  generating the answers with `cmd/route` or `/route` would make the suite
+  test the router against itself.
+- Realtime tests build protobuf fixtures in memory, so no binary blob is
+  checked in and they need no network. `TestLiveFeed` hits the real KCM
+  endpoint and skips (not fails) when it is unreachable.
 - `internal/gtfs/types.go` and `internal/timetable/timetable.go` are flagged
   by newer gofmt versions than the one they were written with. Left alone so
   the diff stays about Phase 3; worth a standalone formatting commit.
