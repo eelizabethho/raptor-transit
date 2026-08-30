@@ -142,6 +142,9 @@ func TestRouteOvernightLeg(t *testing.T) {
 	if j.ArrivalSeconds != 92700 {
 		t.Errorf("arrival_seconds = %d, want 92700", j.ArrivalSeconds)
 	}
+	if !j.NextDay {
+		t.Error("journey next_day = false on a journey arriving at 25:45")
+	}
 	leg := j.Legs[len(j.Legs)-1]
 	if !leg.NextDay {
 		t.Error("next_day = false on a leg arriving at 25:45")

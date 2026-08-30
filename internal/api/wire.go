@@ -64,6 +64,10 @@ type Journey struct {
 	// at the stop. Clients wanting door-to-door can subtract
 	// DepartureSeconds from the requested time themselves.
 	DurationSeconds int32 `json:"duration_seconds"`
+	// NextDay reports that the journey arrives after midnight on the
+	// service date, mirroring the per-leg flag so a client reading only
+	// journey-level times doesn't have to infer it from ArrivalSeconds.
+	NextDay bool `json:"next_day,omitempty"`
 	// Transfers counts transit legs minus one; walking legs don't count.
 	Transfers int   `json:"transfers"`
 	Legs      []Leg `json:"legs"`
@@ -117,13 +121,14 @@ func stopRef(tt *timetable.Timetable, idx int32) StopRef {
 // toWireJourney converts an engine journey into its wire form.
 func toWireJourney(tt *timetable.Timetable, j raptor.Journey) Journey {
 	dep, _ := clock(j.Departure)
-	arr, _ := clock(j.Arrival)
+	arr, nextDay := clock(j.Arrival)
 	out := Journey{
 		Departure:        dep,
 		Arrival:          arr,
 		DepartureSeconds: j.Departure,
 		ArrivalSeconds:   j.Arrival,
 		DurationSeconds:  j.Arrival - j.Departure,
+		NextDay:          nextDay,
 		Transfers:        j.Transfers,
 		Legs:             make([]Leg, 0, len(j.Legs)),
 	}
